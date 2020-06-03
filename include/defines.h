@@ -1,8 +1,8 @@
 #ifndef DEFINES_H
 #define DEFINES_H
 
-#define DIM = 256
-#define DIMSQ = (DIM*DIM)
+#define DIM 256
+#define DIMSQ (DIM*DIM)
 
 // padding necessities
 #define COLPAD (1 + DIM/2)
@@ -19,5 +19,7 @@
 // thread organization
 #define TW 64
 #define TH 64
+#define BLOCKDX 64
+#define BLOCKDY 4
 
 #endif
