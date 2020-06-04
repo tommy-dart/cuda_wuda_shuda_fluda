@@ -7,7 +7,7 @@ Cuda, OpenGL, Glew, Glut
 
 Clone the repository.
 ```
-git clone https://
+git clone https://github.com/tommy-dart/cuda_wuda_shuda_fluda.git
 ```
 
 ## Build

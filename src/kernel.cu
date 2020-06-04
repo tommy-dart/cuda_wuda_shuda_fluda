@@ -7,6 +7,10 @@
 #define HELPERGL_EXTERN_GL_FUNC_IMPLEMENTATION
 #include <helper_gl.h>
 
+// #include "kernel.cuh"
+
+// texture<float2, 2> texObj;
+
 __global__ void add_forces()
 {
     uint idx = threadIdx.x;
@@ -26,23 +30,25 @@ __global__ void add_forces()
 }
 
 
-__global__ void advect_velocity(double2 *v, double *vx, double *vy, int2 domain)
+__global__ void advect_velocity(double2 *v, double2 *vx, double2 *vy, int domain, int pad, int dt, int tpr)
 {
     uint idx = blockIdx.x * blockDim.x + threadIdx.x;
-    // uint idy = blockIdx.y * ()
+    // printf("%d\n", idx);
+    uint idy = blockIdx.y * (tpr * blockDim.y) + threadIdx.y * tpr;
 
-    if (idx >= domain.x) return;
+    if (idx >= domain) return;
 
-    double2 vtex, ploc;
+    // has to be float2, b/c o conversion from float2 to double2
+    float2 vtex, ploc;
 
-    // for (uint i = 0; i < tpr; i++) {
-    //     uint j = idy + i;
-    //
-    //     if (j >= domain.y) return;
-    //
-    //     uint k = j * pad + idx;
-    //
-    //     vtex = tex2D<double2>(texObject, (double) idx, (double) j);
+    for (uint i = 0; i < tpr; i++) {
+        uint j = idy + i;
+
+        if (j >= domain) return;
+
+        uint k = j * pad + idx;
+
+        // vtex = tex2D(texObj, (float) idx, (float) j);
     //
     //     ploc.x = (idx + .5f) - (dt*vtex.x*dx); // bilinear interpolation in velocity space
     //     ploc.y = (idx + .5f) - (dt*vtex.y*dy);
@@ -51,7 +57,7 @@ __global__ void advect_velocity(double2 *v, double *vx, double *vy, int2 domain)
     //
     //     vx[k] = vtex.x;
     //     vx[k] = vtex.y;
-    // }
+    }
 }
 
 __global__ void diffuse_projection()
