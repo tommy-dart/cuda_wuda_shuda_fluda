@@ -55,10 +55,10 @@ static int fpsLimit = 1;
 StopWatchInterface *timer = NULL;
 
 // data for calculations
-static double2 *particles = NULL;
+static float2 *particles = NULL;
 static int xp = 0, yp = 0;
-static double2 *vhost = NULL, *vdev = NULL;
-static double2 *vx = NULL, *vy = NULL;
+static float2 *vhost = NULL, *vdev = NULL;
+static float2 *vx = NULL, *vy = NULL;
 static int window_h = max(512, DIM), window_w = max(512, DIM);
 
 // GL necessities
@@ -67,14 +67,14 @@ struct cudaGraphicsResource *cuda_vbo_resource;
 static cudaArray *array = NULL;
 // cudaTextureObject_t texObj;
 size_t pitch = 0;
-size_t t_pitch;
+
 
 char *ref_file = NULL;
 
 
 // Texture
 // texture<float2, 2> texObj;
-static cudaArray *textArray = NULL;
+// static cudaArray *textArray = NULL;
 
 // CUFFT
 cufftHandle planr2c;
@@ -82,67 +82,37 @@ cufftHandle planc2r;
 
 
 
-void bindTexture()
-{
-    cudaBindTextureToArray(texObj, array);
-    getLastCudaError("cudaBindTexture failed");
-}
-
-
-void updateTexture(void)
-{
-    // cout << DIM << endl;
-    cudaMemcpy2DToArray(array, 0, 0, vdev, t_pitch, DIM*sizeof(double2), DIM, cudaMemcpyDeviceToDevice);
-    // getLastCudaError("cudaMemcpy failed");
-}
-
-
-void setupTexture(int x, int y)
-{
-    texObj.filterMode = cudaFilterModeLinear;
-    cudaChannelFormatDesc desc = cudaCreateChannelDesc<float2>();
-
-    cudaMallocArray(&array, &desc, y, x);
-    getLastCudaError("cudaMalloc failed");
-
-    // cudaResourceDesc texRes;
-    // memset(&texRes,0,sizeof(cudaResourceDesc));
-    //
-    // texRes.resType = cudaResourceTypeArray;
-    // texRes.res.array.array = array;
-    // //
-    //
-    // cudaTextureDesc texDescr;
-    // memset(&texDescr,0,sizeof(cudaTextureDesc));
-    //
-    // texDescr.normalizedCoords = false;
-    // texDescr.filterMode       = cudaFilterModeLinear;
-    // texDescr.addressMode[0] = cudaAddressModeWrap;
-    // texDescr.readMode = cudaReadModeElementType;
-    //
-    // checkCudaErrors(cudaCreateTextureObject(&texObj, &texRes, &texDescr, NULL));
-}
-
-
-
 void fluid_simulation_step() {
     // simple four steps from Stable Fluids paper
-    int grid_x = 1;
-    int grid_y = 1;
     dim3 grid(TW, TH);
     dim3 block(BLOCKDX, BLOCKDY);
 
-    updateTexture();
-    advect_velocity<<<grid, block>>>(vdev, vx, vy, DIM, ROWPAD, DT, grid_x/grid_y);
-    //
+    updateTexture(vdev);
+    advect_velocity<<<grid, block>>>(vdev, (float *)vx, (float *)vy, DIM, ROWPAD, DT, TW/TH);
     // getLastCudaError("advect_velocity failed");
-    // diffuse_projection();
-    // update_velocity();
-    // advect_particles();
+
+    // checkCudaErrors(cufftExecR2C(planr2c, (cufftReal *)vx, (cufftComplex *)vx));
+    // checkCudaErrors(cufftExecR2C(planr2c, (cufftReal *)vy, (cufftComplex *)vy));
+
+    diffuse_projection<<<grid, block>>>(vx, vy, DIM, DT, VISC, TW/TH);
+
+    // checkCudaErrors(cufftExecC2R(planc2r, (cufftComplex *)vx, (cufftReal *)vx));
+    // checkCudaErrors(cufftExecC2R(planc2r, (cufftComplex *)vy, (cufftReal *)vy));
+
+    update_velocity_cpu(vdev, (float *)vx, (float *)vy, DIM, ROWPAD, DT, TW/TH);
+
+    float2 *p;
+    cudaGraphicsMapResources(1, &cuda_vbo_resource, 0);
+    size_t num_bytes;
+    cudaGraphicsResourceGetMappedPointer((void **)&p, &num_bytes, cuda_vbo_resource);
+
+    advect_particles_cpu(p, vdev, DIM, DT, TW/TH);
+
+    cudaGraphicsUnmapResources(1, &cuda_vbo_resource, 0);
 }
 
 
-void init_particles(double2 *p, int dx, int dy) {
+void init_particles(float2 *p, int dx, int dy) {
     for (int i=0; i<dy; i++){
         for (int j=0; j<dx; j++) {
             uint idx = i*dx + j;
@@ -163,15 +133,15 @@ void init_particles(double2 *p, int dx, int dy) {
 //
 //         case 'r':
 //             // reinit velocity/position states
-//             memset(vhost, 0, sizeof(double2) * DIMSQ);
-//             cudaMemcpy(vdev, vhost, sizeof(double2) * DIMSQ, cudaMemcpyHostToDevice);
+//             memset(vhost, 0, sizeof(float2) * DIMSQ);
+//             cudaMemcpy(vdev, vhost, sizeof(float2) * DIMSQ, cudaMemcpyHostToDevice);
 //             init_particles(particles, DIM, DIM);
 //
 //             cudaGraphicsUnregisterResource(cuda_vbo_resource);
 //             getLastCudaError("cudaGraphicsUnregisterBuffer failed!");
 //
 //             glBindBuffer(GL_ARRAY_BUFFER, vbo);
-//             glBufferData(GL_ARRAY_BUFFER, sizeof(double2)*DIMSQ, particles, GL_DYNAMIC_DRAW_ARB);
+//             glBufferData(GL_ARRAY_BUFFER, sizeof(float2)*DIMSQ, particles, GL_DYNAMIC_DRAW_ARB);
 //             glBindBuffer(GL_ARRAY_BUFFER, 0);
 //
 //             cudaGraphicsGLRegisterBuffer(&cuda_vbo_resource, vbo, cudaGraphicsMapFlagsNone);
@@ -258,6 +228,7 @@ void display(void) {
     glEnableClientState(GL_VERTEX_ARRAY);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
+    cout << vbo << endl;
     // glBindBuffer(GL_ARRAY_BUFFER, vbo);
     // glVertexPointer(2, GL_FLOAT, 0, NULL);
     // glDrawArrays(GL_POINTS, 0, DIMSQ);
@@ -365,20 +336,20 @@ int main(int argc, char **argv) {
     sdkResetTimer(&timer);
 
     // setup host data for simulation
-    vhost = (double2 *) malloc(sizeof(double2) * DIMSQ);
-    memset(vhost, 0, sizeof(double2)*DIMSQ);
+    vhost = (float2 *) malloc(sizeof(float2) * DIMSQ);
+    memset(vhost, 0, sizeof(float2)*DIMSQ);
 
     // setup device data for fluid simulation
-    particles = (double2 *) malloc(sizeof(double2)*DIMSQ);
-    memset(particles, 0, sizeof(double2)*DIMSQ);
+    particles = (float2 *) malloc(sizeof(float2)*DIMSQ);
+    memset(particles, 0, sizeof(float2)*DIMSQ);
     init_particles(particles, DIM, DIM);
 
-    cudaMallocPitch((void **)&vdev, &pitch, sizeof(double2)*DIM, DIM);
+    cudaMallocPitch((void **)&vdev, &pitch, sizeof(float2)*DIM, DIM);
     getLastCudaError("cudaMallocPitch failed");
-    cudaMemcpy(vdev, vhost, sizeof(double2)*DIMSQ, cudaMemcpyHostToDevice);
+    cudaMemcpy(vdev, vhost, sizeof(float2)*DIMSQ, cudaMemcpyHostToDevice);
 
-    cudaMalloc((void **)&vx, sizeof(double2) * PADSZ);
-    cudaMalloc((void **)&vy, sizeof(double2) * PADSZ);
+    cudaMalloc((void **)&vx, sizeof(float2) * PADSZ);
+    cudaMalloc((void **)&vy, sizeof(float2) * PADSZ);
 
 
     setupTexture(DIM, DIM);
@@ -392,26 +363,24 @@ int main(int argc, char **argv) {
     // cufftSetCompatibilityMode(planr2c, CUFFT_COMPATIBILITY_FFTW_PADDING);
     // cufftSetCompatibilityMode(planc2r, CUFFT_COMPATIBILITY_FFTW_PADDING);
 
-    cout << vbo << std::endl;
-    // glutMainLoop();
-    // glGenBuffers(1, &vbo);
-    // glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    // glBufferData(GL_ARRAY_BUFFER, sizeof(double2)*DIMSQ, particles, GL_DYNAMIC_DRAW_ARB);
+    glGenBuffers(1, &vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(float2)*DIMSQ, particles, GL_DYNAMIC_DRAW_ARB);
 
-    // glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE, &bsize);
-    //
-    // if (bsize != (sizeof(double2) * DIMSQ)) exit(1);
-    //
-    // glBindBuffer(GL_ARRAY_BUFFER, 0);
-    //
-    // checkCudaErrors(cudaGraphicsGLRegisterBuffer(&cuda_vbo_resource, vbo, cudaGraphicsMapFlagsNone));
-    // getLastCudaError("cudaGraphicsGLRegisterBuffer failed");
+    glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE, &bsize);
 
-    // for (int ct=0; ct<STEPS; ct++) {
-    //     fluid_simulation_step();
-    //
-    //     // addForces(vhost, DIM, DIM, spx, spy);
-    // }
+    if (bsize != (sizeof(float2) * DIMSQ)) exit(1);
+
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+    checkCudaErrors(cudaGraphicsGLRegisterBuffer(&cuda_vbo_resource, vbo, cudaGraphicsMapFlagsNone));
+    getLastCudaError("cudaGraphicsGLRegisterBuffer failed");
+
+    for (int ct=0; ct<STEPS; ct++) {
+        fluid_simulation_step();
+
+        // addForces(vhost, DIM, DIM, spx, spy);
+    }
 
     return 0;
 }
