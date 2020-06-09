@@ -23,7 +23,7 @@ set (PROJECT_SRC_DIR      "${PROJECT_SOURCE_DIR}/src")
 
 #### Source Files ####
 
-#file(GLOB_RECURSE SOURCES "*.cpp" "*.c")
+file(GLOB_RECURSE SOURCES "${PROJECT_SRC_DIR}/*.cpp")
 file(GLOB_RECURSE SOURCES_CUDA "${PROJECT_SRC_DIR}/*.cu")
 
 
@@ -36,7 +36,6 @@ include_directories(
     ${GLUT_INCLUDE_DIRS}
     ${GLEW_INCLUDE_DIRS}
 )
-
 
 #### Compilation ####
 
@@ -66,6 +65,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR})
 
 cuda_add_executable(${PROJECT_NAME}
     ${SOURCES_CUDA}
+    ${SOURCES}
 )
 
 target_link_libraries(${PROJECT_NAME}

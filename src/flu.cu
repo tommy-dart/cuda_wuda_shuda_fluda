@@ -1,16 +1,15 @@
 #include <GL/glew.h>    // GLint
 #include <GL/glut.h>
 
-
 // General imports
 #include <iostream>
-// #include <fstream>
-// #include <vector>
-// #include <chrono>
+#include <fstream>
+#include <vector>
+#include <complex>
+#include <math.h>
+#include <ctime>
+#include <chrono>
 // #include <stdlib.h>
-
-// CUDA FFT Libraries
-#include <cufft.h>
 
 // CUDA imports
 #include <cuda_runtime.h>
@@ -21,138 +20,98 @@
 
 #include "defines.h"
 #include "kernel.cuh"
-
-// OpenGL check functions
-// #ifdef WIN32
-// bool hasOpenGL() return true;
-// #else
-// #if defined(__APPLE__) || defined(MACOSX)
-// bool hasOpenGL() return true;
-// #else
-// #include <X11/Xlib.h>
-// bool hasOpenGL() {
-//     Display *Xdisplay;
-//
-//     if (Xdisplay = XOpenDisplay(NULL)){
-//         XCloseDisplay(Xdisplay);
-//         return true;
-//     }
-//     return false;
-// }
-// #endif
-// #endif
-//
+#include "func_cpu.cuh"
 
 
 using namespace std;
+using namespace chrono;
 
-bool g_bExitESC = false;
+typedef complex<float> fcomp;
+
+// GPU or CPU implementation
+bool gpu_impl = true;
 
 //simulation tracking variables
 static int click_on = 0;
-static int fpsCount = 0;
-static int fpsLimit = 1;
-StopWatchInterface *timer = NULL;
-
-// data for calculations
-static float2 *particles = NULL;
 static int xp = 0, yp = 0;
+static int window_h = DIM, window_w = DIM;
+//
+// // data for calculations
+static float2 *particles = NULL;
+static float2 *particles_dev = NULL;
 static float2 *vhost = NULL, *vdev = NULL;
-static float2 *vx = NULL, *vy = NULL;
-static int window_h = max(512, DIM), window_w = max(512, DIM);
+
+static float2 *vx_fft = NULL, *vy_fft = NULL;
+static float2 *vx_fft_host = NULL, *vy_fft_host = NULL;
 
 // GL necessities
 GLuint vbo = 0;
-struct cudaGraphicsResource *cuda_vbo_resource;
-static cudaArray *array = NULL;
-// cudaTextureObject_t texObj;
-size_t pitch = 0;
+static float3 *image = NULL;
+
+// CPU version
+static float2 *v = NULL;
+static vector<fcomp> vx_comp, vy_comp;
+
+// Timing
+static int cur_time_iter = 0;
+ofstream out;
 
 
-char *ref_file = NULL;
+void fluid_simulation_step_gpu();
+void fluid_simulation_step_cpu();
 
 
-// Texture
-// texture<float2, 2> texObj;
-// static cudaArray *textArray = NULL;
-
-// CUFFT
-cufftHandle planr2c;
-cufftHandle planc2r;
-
-
-
-void fluid_simulation_step() {
-    // simple four steps from Stable Fluids paper
-    dim3 grid(TW, TH);
-    dim3 block(BLOCKDX, BLOCKDY);
-
-    updateTexture(vdev);
-    advect_velocity<<<grid, block>>>(vdev, (float *)vx, (float *)vy, DIM, ROWPAD, DT, TW/TH);
-    // getLastCudaError("advect_velocity failed");
-
-    // checkCudaErrors(cufftExecR2C(planr2c, (cufftReal *)vx, (cufftComplex *)vx));
-    // checkCudaErrors(cufftExecR2C(planr2c, (cufftReal *)vy, (cufftComplex *)vy));
-
-    diffuse_projection<<<grid, block>>>(vx, vy, DIM, DT, VISC, TW/TH);
-
-    // checkCudaErrors(cufftExecC2R(planc2r, (cufftComplex *)vx, (cufftReal *)vx));
-    // checkCudaErrors(cufftExecC2R(planc2r, (cufftComplex *)vy, (cufftReal *)vy));
-
-    update_velocity_cpu(vdev, (float *)vx, (float *)vy, DIM, ROWPAD, DT, TW/TH);
-
-    float2 *p;
-    cudaGraphicsMapResources(1, &cuda_vbo_resource, 0);
-    size_t num_bytes;
-    cudaGraphicsResourceGetMappedPointer((void **)&p, &num_bytes, cuda_vbo_resource);
-
-    advect_particles_cpu(p, vdev, DIM, DT, TW/TH);
-
-    cudaGraphicsUnmapResources(1, &cuda_vbo_resource, 0);
-}
-
-
-void init_particles(float2 *p, int dx, int dy) {
-    for (int i=0; i<dy; i++){
-        for (int j=0; j<dx; j++) {
-            uint idx = i*dx + j;
-            p[idx].x = (j + rand())/dx;
-            p[idx].y = (i + rand())/dy;
+void init_particles(float2 *p,  int dim) {
+    for (int i=0; i<dim; i++){
+        for (int j=0; j<dim; j++) {
+            uint idx = i * dim + j;
+            p[idx].x = (i + 0.5f + ((rand() / (float)RAND_MAX) - 0.5f)) / dim;
+            p[idx].y = (j + 0.5f + ((rand() / (float)RAND_MAX) - 0.5f)) / dim;
         }
     }
 }
 
 
-// (for OpenGL)
-// keyboard handling: x == exit, r == reset
-// void keyboard(unsigned char key, int x, int y) {
-//     switch (key) {
-//         case 'x':
-//             g_bExitESC = true;
-//             return;
-//
-//         case 'r':
-//             // reinit velocity/position states
-//             memset(vhost, 0, sizeof(float2) * DIMSQ);
-//             cudaMemcpy(vdev, vhost, sizeof(float2) * DIMSQ, cudaMemcpyHostToDevice);
-//             init_particles(particles, DIM, DIM);
-//
-//             cudaGraphicsUnregisterResource(cuda_vbo_resource);
-//             getLastCudaError("cudaGraphicsUnregisterBuffer failed!");
-//
-//             glBindBuffer(GL_ARRAY_BUFFER, vbo);
-//             glBufferData(GL_ARRAY_BUFFER, sizeof(float2)*DIMSQ, particles, GL_DYNAMIC_DRAW_ARB);
-//             glBindBuffer(GL_ARRAY_BUFFER, 0);
-//
-//             cudaGraphicsGLRegisterBuffer(&cuda_vbo_resource, vbo, cudaGraphicsMapFlagsNone);
-//
-//             getLastCudaError("cudaGraphicsGLRegisterBuffer failed");
-//             break;
-//
-//         default:
-//             break;
-//     }
-// }
+void update_image(float2 *p, float3 *img , int dim) {
+    float2 pt;
+
+    for (int i = 0; i < dim; i++) {
+        for (int j=0; j<dim; j++) {
+            uint i_idx = i * dim + j;
+            img[i_idx].z = 0.0f;
+            img[i_idx].x = 0.5f;
+            img[i_idx].y = 0.1f;
+        }
+    }
+
+    for (int i=0; i<dim; i++){
+        for (int j=0; j<dim; j++) {
+            uint p_idx = i * dim + j;
+            pt = p[p_idx];
+
+            int pti = (int) (pt.x*dim);
+            int ptj = (int) (pt.y*dim);
+
+            int i_idx = pti * dim + ptj;
+
+            if (img[i_idx].z < 1.0)
+                img[i_idx].z += 0.33f; // make it blu like watar
+
+        }
+    }
+}
+
+
+void init_image(float3 *img,  int dim) {
+    for (int i=0; i<dim; i++){
+        for (int j=0; j<dim; j++) {
+            uint idx = i * dim + j;
+            img[idx].x = 0.0;
+            img[idx].y = 0.0;
+            img[idx].z = 0.0;
+        }
+    }
+}
 
 
 // (for OpenGL)
@@ -164,12 +123,28 @@ void click(int button, int updown, int x, int y) {
 }
 
 
-// (for OpenGL)
-// handle mouse motion to generate force @mouse if clicked
+// Handler for window's re-size event
+void reshape(GLsizei width, GLsizei height) {  // GLsizei: non-negative integer
+   if (height == 0) height = 1;  // prevent divide by 0
+
+   // Set the viewport (display area) to cover entire application window
+   glViewport(0, 0, width, height);
+
+   // Select the aspect ratio of the clipping area to match the viewport
+   glMatrixMode(GL_PROJECTION);  // Select the Projection matrix
+   glLoadIdentity();             // Reset the Projection matrix
+   gluPerspective(45.0, (float)width / (float)height, 0.1, 100.0);
+
+   // Reset the Model-View matrix
+   glMatrixMode(GL_MODELVIEW);  // Select the Model-View matrix
+   glLoadIdentity();            // Reset the Model-View matrix
+}
+
+
 void motion(int x, int y) {
     // convert mouse to domain
-    double fx = xp / ((double) window_w);
-    double fy = yp / ((double) window_h);
+    float fx = xp / ((float) window_w);
+    float fy = yp / ((float) window_h);
     int nx = (int) (fx * DIM);
     int ny = (int) (fy * DIM);
 
@@ -179,13 +154,16 @@ void motion(int x, int y) {
             int dx = x - xp;
             int dy = y - yp;
 
-            fx = FORCE * DT * dx / (double) window_w;
-            fy = FORCE * DT * dy / (double) window_h;
+            fx = FORCE * DT * ((float)dx) / ((float) window_w);
+            fy = FORCE * DT * ((float)dy) / ((float) window_h);
 
-            int px = nx-FRADIUS;
-            int py = ny-FRADIUS;
+            int spx = nx - FRADIUS;
+            int spy = ny - FRADIUS;
 
-            // add_forces(vdev, DIM, DIM, px, py, fx, fy, FRADIUS);
+            if (gpu_impl)
+                add_forces_host(vdev, spx, spy, fx, fy);
+            else
+                add_forces_cpu(v, DIM, spx, spy, fx, fy, FRADIUS);
 
             xp = x;
             yp = y;
@@ -195,192 +173,249 @@ void motion(int x, int y) {
 }
 
 
-// (for OpenGL)
-// reshape window function
-void reshape(int x, int y) {
-    window_w = x;
-    window_h = y;
-    glViewport(0, 0, x, y);
-    glMatrixMode(GL_PROJECTION);
-    glLoadIdentity();
-    glOrtho(0,1,1,0,0,1);
-    glMatrixMode(GL_MODELVIEW);
-    glLoadIdentity();
-    glutPostRedisplay();
-}
-
-
-// (for OpenGL)
-// display window function
 void display(void) {
-    if (!ref_file)
-    {
-        sdkStartTimer(&timer);
-        fluid_simulation_step();
-    }
+    if (gpu_impl)
+        fluid_simulation_step_gpu();
+    else
+        fluid_simulation_step_cpu();
 
-    glClear(GL_COLOR_BUFFER_BIT);
-    glColor4f(0.f, 1.f, 0.f, 0.5f);
-    glPointSize(1);
-    glEnable(GL_POINT_SMOOTH);
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glEnableClientState(GL_VERTEX_ARRAY);
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_CULL_FACE);
-    cout << vbo << endl;
-    // glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    // glVertexPointer(2, GL_FLOAT, 0, NULL);
-    // glDrawArrays(GL_POINTS, 0, DIMSQ);
-    // glBindBuffer(GL_ARRAY_BUFFER, 0);
-    // glDisableClientState(GL_VERTEX_ARRAY);
-    // glDisableClientState(GL_TEXTURE_COORD_ARRAY);
-    // glDisable(GL_TEXTURE_2D);
+    update_image(particles, image, DIM);
 
-    if (ref_file)
-    {
-        return;
-    }
+    // Load up particles
 
-    // Finish timing before swap buffers to avoid refresh sync
-    sdkStopTimer(&timer);
-    glutSwapBuffers();
+    glShadeModel(GL_SMOOTH);               // Enable smooth shading of color
+    glClearColor(1.0f, 1.0f, 1.0f, 1.0f);  // Set background (clear) color to white
 
-    fpsCount++;
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, DIM, DIM, 0, GL_RGB,
+            GL_FLOAT, image);  // Create texture from image data
+    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
+    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
 
-    if (fpsCount == fpsLimit)
-    {
-        char fps[256];
-        float ifps = 1.f / (sdkGetAverageTimerValue(&timer) / 1000.f);
-        sprintf(fps, "Cuda/GL Stable Fluids (%d x %d): %3.1f fps", DIM, DIM, ifps);
-        glutSetWindowTitle(fps);
-        fpsCount = 0;
-        fpsLimit = (int)MAX(ifps, 1.f);
-        sdkResetTimer(&timer);
-    }
+    glEnable(GL_TEXTURE_2D);  // Enable 2D texture
+
+
+    // Draw particles
+
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT); // Clear screen and depth buffers
+
+    // Draw cube
+    glLoadIdentity();   // Reset the view
+    glTranslatef(0.0f, 0.0f, -3.4f);
+
+    if (!gpu_impl)
+        glRotatef(270.0f, 0.0f, 0.0f, 1.0f);
+
+
+    glBegin(GL_QUADS);
+       // Front Face
+       glTexCoord2f(0.0f, 0.0f); glVertex3f(-1.0f, -1.0f,  1.0f);
+       glTexCoord2f(1.0f, 0.0f); glVertex3f( 1.0f, -1.0f,  1.0f);
+       glTexCoord2f(1.0f, 1.0f); glVertex3f( 1.0f,  1.0f,  1.0f);
+       glTexCoord2f(0.0f, 1.0f); glVertex3f(-1.0f,  1.0f,  1.0f);
+    glEnd();
+    glutSwapBuffers(); // Swap front and back buffers (double buffered mode)
 
     glutPostRedisplay();
 }
 
 
-int initGL(int *argc, char **argv) {
+int initGl(int *argc, char* argv[]) {
     glutInit(argc, argv);
     glutInitDisplayMode(GLUT_RGBA | GLUT_DOUBLE);
     glutInitWindowSize(window_w, window_h);
-    glutCreateWindow("Stable Fluid Simulation");
+    glutInitWindowPosition(100, 100);
+    glutCreateWindow("Fluda!");
+
     glutDisplayFunc(display);
-    glutMainLoop();
-    // glutKeyboardFunc(keyboard);
-    // glutMouseFunc(click);
-    // glutMotionFunc(motion);
-    // glutReshapeFunc(reshape);
+    glutMouseFunc(click);
+    glutMotionFunc(motion);
+    glutReshapeFunc(reshape);    // Register handler for window re-size
 
     return true;
 }
 
 
-/** TESTING HELLO WORLD **/
-void displayForGlut(void) {
-    //clears the pixels
-    glClear(GL_COLOR_BUFFER_BIT);
-    glColor3f(1.0, 0.0, 0.0);
-    glBegin(GL_QUADS);
-    glVertex3f(0.10, 0.10, 0.0);
-    glVertex3f(0.9, 0.10, 0.0);
-    glVertex3f(0.9, 0.9, 0.0);
-    glVertex3f(0.10, 0.9, 0.0);
-    glEnd();
-    glFlush();
+void fluid_simulation_step_cpu() {
+    time_point<system_clock> time_start, time_cmp_start;
+    duration<double> velocity_time, diffuse_time, particle_time, elapsed_cmp_time;
+
+    time_cmp_start = system_clock::now();
+
+    time_start = system_clock::now();
+    advect_velocity_cpu(v, (float *)vx_fft, (float *)vy_fft, DIM, DT);
+    velocity_time = system_clock::now() - time_start;
+
+
+    copy_f2s_to_comps(vx_fft, vy_fft, vx_comp, vy_comp);
+    fft_cpu(vx_comp, false);
+    fft_cpu(vy_comp, false);
+    copy_comps_to_f2s(vx_comp, vy_comp, vx_fft, vy_fft);
+
+    time_start = system_clock::now();
+    diffuse_projection_cpu(vx_fft, vy_fft, DIM, DT, VISC);
+    diffuse_time = system_clock::now() - time_start;
+
+    copy_f2s_to_comps(vx_fft, vy_fft, vx_comp, vy_comp);
+
+    fft_cpu(vx_comp, true);
+    fft_cpu(vy_comp, true);
+
+    copy_comps_to_f2s(vx_comp, vy_comp, vx_fft, vy_fft);
+
+    update_velocity_cpu(v, (float *)vx_fft, (float *)vy_fft, DIM);
+
+    time_start = system_clock::now();
+    advect_particles_cpu(particles, v, DIM, DT);
+    particle_time = system_clock::now() - time_start;
+
+    // Computation time testing
+    elapsed_cmp_time = system_clock::now() - time_cmp_start;
+
+    if (cur_time_iter < TEST_ITER)
+    {
+        out << elapsed_cmp_time.count() << " "
+            << velocity_time.count() << " "
+            << diffuse_time.count() << " "
+            << particle_time.count() << endl;
+    }
+    cur_time_iter++;
 }
 
-int initGlutDisplay(int argc, char* argv[]) {
-    glutInit(&argc, argv);
-    glutInitDisplayMode(GLUT_RGB);
-    glutInitWindowSize(300, 300);
-    glutInitWindowPosition(100, 100);
-    glutCreateWindow("Example 1.0: Hello World!");
-    glMatrixMode(GL_PROJECTION);
-    glLoadIdentity();
-    glOrtho(0.0, 1.0, 0.0, 1.0, -1.0, 1.0);
-    glutDisplayFunc(displayForGlut);
-    glutMainLoop();
-    return 0;
+
+void fluid_simulation_step_gpu() {
+    // simple four steps from Stable Fluids paper
+
+    // Computation time testing
+    time_point<system_clock> time_start, time_cmp_start;
+    duration<double> velocity_time, diffuse_time, particle_time, elapsed_cmp_time;
+
+    time_cmp_start = system_clock::now();
+
+    time_start = system_clock::now();
+    advect_velocity_host(vdev, (float *)vx_fft, (float *)vy_fft);
+    velocity_time = system_clock::now() - time_start;
+
+
+    copy_device_f2s_to_comps(vx_fft, vy_fft, vx_fft_host, vy_fft_host, vx_comp, vy_comp);
+    fft_cpu(vx_comp, false);
+    fft_cpu(vy_comp, false);
+    copy_comps_to_f2s_device(vx_comp, vy_comp, vx_fft, vy_fft, vx_fft_host, vy_fft_host);
+
+    time_start = system_clock::now();
+    diffuse_projection_host(vx_fft, vy_fft);
+    diffuse_time = system_clock::now() - time_start;
+
+    copy_device_f2s_to_comps(vx_fft, vy_fft, vx_fft_host, vy_fft_host, vx_comp, vy_comp);
+    fft_cpu(vx_comp, true);
+    fft_cpu(vy_comp, true);
+    copy_comps_to_f2s_device(vx_comp, vy_comp, vx_fft, vy_fft, vx_fft_host, vy_fft_host);
+
+    update_velocity_host(vdev, (float *)vx_fft, (float *)vy_fft);
+
+    cudaMemcpy(particles_dev, particles, sizeof(float2)*DIMSQ, cudaMemcpyHostToDevice);
+
+    time_start = system_clock::now();
+    advect_particles_host(particles_dev, vdev);
+    particle_time = system_clock::now() - time_start;
+
+    cudaMemcpy(particles, particles_dev, sizeof(float2)*DIMSQ, cudaMemcpyDeviceToHost);
+
+
+    // Computation time testing
+    elapsed_cmp_time = system_clock::now() - time_cmp_start;
+
+    if (cur_time_iter < TEST_ITER)
+    {
+        out << elapsed_cmp_time.count() << " "
+            << velocity_time.count() << " "
+            << diffuse_time.count() << " "
+            << particle_time.count() << endl;
+    }
+
+    cur_time_iter++;
 }
-
-
-
 
 
 int main(int argc, char **argv) {
 
-    // setup OpenGL
-    int dev_id;
-    GLint bsize;
-    cudaDeviceProp deviceProps;
-
-    if (initGL(&argc, argv) == false) exit(1);
-
-    /** TESTING HELLO WORLD **/
-    // if (initGlutDisplay(argc, argv) == false) exit(1);
-
-    dev_id = findCudaDevice(argc, (const char **) argv); // attempt to use specified CUDA device
-
-    checkCudaErrors(cudaGetDeviceProperties(&deviceProps, dev_id));
-    printf("Using CUDA device [%s] (%d processors)\n",
-            deviceProps.name,
-            deviceProps.multiProcessorCount);
-
-    // ref_file = "data/ref_fluidsGL.ppm";
-
-    sdkCreateTimer(&timer);
-    sdkResetTimer(&timer);
-
-    // setup host data for simulation
-    vhost = (float2 *) malloc(sizeof(float2) * DIMSQ);
-    memset(vhost, 0, sizeof(float2)*DIMSQ);
-
-    // setup device data for fluid simulation
+    // Initialize particles
     particles = (float2 *) malloc(sizeof(float2)*DIMSQ);
     memset(particles, 0, sizeof(float2)*DIMSQ);
-    init_particles(particles, DIM, DIM);
+    init_particles(particles, DIM);
 
-    cudaMallocPitch((void **)&vdev, &pitch, sizeof(float2)*DIM, DIM);
-    getLastCudaError("cudaMallocPitch failed");
-    cudaMemcpy(vdev, vhost, sizeof(float2)*DIMSQ, cudaMemcpyHostToDevice);
+    image = (float3 *) malloc(sizeof(float3)*DIMSQ);
+    memset(image, 0, sizeof(float3)*DIMSQ);
+    init_image(image, DIM);
 
-    cudaMalloc((void **)&vx, sizeof(float2) * PADSZ);
-    cudaMalloc((void **)&vy, sizeof(float2) * PADSZ);
+    // Initialize interactable GUI
+    if (initGl(&argc, argv) == false) exit(1);
 
+    // In GPU case
+    if (gpu_impl)
+    {
+        int dev_id;
+        cudaDeviceProp deviceProps;
 
-    setupTexture(DIM, DIM);
-    bindTexture();
+        dev_id = findCudaDevice(argc, (const char **) argv);
 
-    // Create CUFFT transform plan configuration
-    checkCudaErrors(cufftPlan2d(&planr2c, DIM, DIM, CUFFT_R2C));
-    checkCudaErrors(cufftPlan2d(&planc2r, DIM, DIM, CUFFT_C2R));
-    // TODO: update kernels to use the new unpadded memory layout for perf
-    // rather than the old FFTW-compatible layout
-    // cufftSetCompatibilityMode(planr2c, CUFFT_COMPATIBILITY_FFTW_PADDING);
-    // cufftSetCompatibilityMode(planc2r, CUFFT_COMPATIBILITY_FFTW_PADDING);
+        checkCudaErrors(cudaGetDeviceProperties(&deviceProps, dev_id));
+        printf("Using CUDA device [%s] (%d processors)\n",
+                deviceProps.name,
+                deviceProps.multiProcessorCount);
 
-    glGenBuffers(1, &vbo);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(float2)*DIMSQ, particles, GL_DYNAMIC_DRAW_ARB);
+        vhost = (float2 *) malloc(sizeof(float2) * DIMSQ);
+        memset(vhost, 0, sizeof(float2)*DIMSQ);
 
-    glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE, &bsize);
+        vx_fft_host = (float2 *) malloc(sizeof(float2) * DIM_FFT_DATA);
+        vy_fft_host = (float2 *) malloc(sizeof(float2) * DIM_FFT_DATA);
+        memset(vx_fft_host, 0, sizeof(float2)*DIM_FFT_DATA);
+        memset(vy_fft_host, 0, sizeof(float2)*DIM_FFT_DATA);
 
-    if (bsize != (sizeof(float2) * DIMSQ)) exit(1);
+        cudaMalloc((void **)&vdev, sizeof(float2)*DIMSQ);
+        cudaMemcpy(vdev, vhost, sizeof(float2)*DIMSQ, cudaMemcpyHostToDevice);
 
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
+        cudaMalloc((void **)&vx_fft, sizeof(float2) * DIM_FFT_DATA);
+        cudaMalloc((void **)&vy_fft, sizeof(float2) * DIM_FFT_DATA);
+        cudaMemcpy(vx_fft, vx_fft_host, sizeof(float2)*DIM_FFT_DATA, cudaMemcpyHostToDevice);
+        cudaMemcpy(vy_fft, vy_fft_host, sizeof(float2)*DIM_FFT_DATA, cudaMemcpyHostToDevice);
 
-    checkCudaErrors(cudaGraphicsGLRegisterBuffer(&cuda_vbo_resource, vbo, cudaGraphicsMapFlagsNone));
-    getLastCudaError("cudaGraphicsGLRegisterBuffer failed");
+        cudaMalloc((void **)&particles_dev, sizeof(float2) * DIMSQ);
+        cudaMemcpy(particles_dev, particles, sizeof(float2)*DIMSQ, cudaMemcpyHostToDevice);
 
-    for (int ct=0; ct<STEPS; ct++) {
-        fluid_simulation_step();
+        getLastCudaError("one of the cudaMallocs failed :(.");
 
-        // addForces(vhost, DIM, DIM, spx, spy);
+        vx_comp = vector<fcomp>(DIM_FFT_DATA);
+        vy_comp = vector<fcomp>(DIM_FFT_DATA);
     }
 
-    return 0;
+    // In CPU case
+    else
+    {
+        v = (float2 *) malloc(sizeof(float2) * DIMSQ);
+        vx_fft = (float2 *) malloc(sizeof(float2) * DIM_FFT_DATA);
+        vy_fft = (float2 *) malloc(sizeof(float2) * DIM_FFT_DATA);
+
+        vx_comp = vector<fcomp>(DIM_FFT_DATA);
+        vy_comp = vector<fcomp>(DIM_FFT_DATA);
+    }
+
+    string file_name;
+    if (gpu_impl)
+        file_name = "gpu_time.dat";
+    else
+        file_name = "cpu_time.dat";
+
+	out.open(file_name.c_str());
+    if(out.fail()){
+		printf("\ncannot open file %s to record results\n",file_name.c_str());
+		return 0;
+	}
+
+
+    out << "total_time adv_vel_time diffuse_time adv_part_time" << endl;
+    glutMainLoop();
+
+    return 1;
 }

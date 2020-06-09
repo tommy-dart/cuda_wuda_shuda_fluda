@@ -1,21 +1,19 @@
 #ifndef __KERNELS_CUH_
 #define __KERNELS_CUH_
 
-// #include "defines.h"
 
-// texture<float2, 2> texObj;
+#include <vector>
+#include <complex>
+typedef std::complex<float> fcomp;
 
-__global__ void advect_velocity(float2 *v, float *vx, float *vy, int domain, int pad, int dt, int tpr);
-__global__ void diffuse_projection(float2 *vx, float2 *vy, int domain, int dt, float visc, int tpr);
-__global__ void update_velocity(float2* v, float *vx, float *vy, int domain, int pad, int dt, int tpr, size_t pitch);\
-__global__ void advect_particles(float2* p, float2* v, int domain, int tp, int tpr, size_t t_pitch);
+void copy_device_f2s_to_comps(float2* vx_dev, float2* vy_dev, float2* vx_host, float2* vy_host, std::vector<fcomp> &vxc, std::vector<fcomp> &vyc);
+void copy_comps_to_f2s_device(std::vector<fcomp> vxc, std::vector<fcomp> vyc, float2* vx_dev, float2* vy_dev, float2* vx_host, float2* vy_host);
 
-void update_velocity_cpu(float2* vdev, float *vx, float *vy, int domain, int pad, int dt, int tpr);
-void advect_particles_cpu(float2* p, float2* vdev, int domain, int dt, int tpr);
+void advect_velocity_host(float2 *v, float *vx, float *vy);
+void diffuse_projection_host(float2 *vx, float2 *vy);
+void update_velocity_host(float2* vdev, float *vx, float *vy);
+void advect_particles_host(float2* p, float2* v);
+void add_forces_host(float2 *v, int px, int py, float fx, float fy);
 
-
-void bindTexture();
-void updateTexture(float2 *vdev);
-void setupTexture(int x, int y);
 
 #endif

@@ -10,198 +10,264 @@
 #include <helper_cuda.h>    // checkCudaErrors
 
 #include "defines.h"
+#include "func_cpu.cuh"
+#include <iostream>
+#include <complex>
+#include <vector>
+
+using namespace std;
+
+extern GLuint vbo;
+
+float2 *vxfield = NULL;
+float2 *vyfield = NULL;
 
 
-// #include "kernel.cuh"
-texture<float2, 2> texObj;
-size_t t_pitch;
-static cudaArray *texArray = NULL;
+void copy_device_f2s_to_comps(float2* vx_dev, float2* vy_dev, float2* vx_host, float2* vy_host, vector<fcomp> &vxc, vector<fcomp> &vyc) {
+    cudaMemcpy(vx_host, vx_dev, sizeof(float2)*DIM_FFT_DATA, cudaMemcpyDeviceToHost);
+    cudaMemcpy(vy_host, vy_dev, sizeof(float2)*DIM_FFT_DATA, cudaMemcpyDeviceToHost);
+    getLastCudaError("cudaMemcpy device_to_host_fft failed");
+
+    for (int i = 0; i < DIM_FFT_DATA; i++) {
+        vxc[i] = float2_to_fcomp(vx_host[i]);
+        vyc[i] = float2_to_fcomp(vy_host[i]);
+    }
+}
 
 
-__global__ void add_forces()
+void copy_comps_to_f2s_device(vector<fcomp> vxc, vector<fcomp> vyc, float2* vx_dev, float2* vy_dev, float2* vx_host, float2* vy_host) {
+    for (int i = 0; i < DIM_FFT_DATA; i++) {
+        vx_host[i] = fcomp_to_float2(vxc[i]);
+        vy_host[i] = fcomp_to_float2(vyc[i]);
+    }
+
+    cudaMemcpy(vx_dev, vx_host, sizeof(float2)*DIM_FFT_DATA, cudaMemcpyHostToDevice);
+    cudaMemcpy(vy_dev, vy_host, sizeof(float2)*DIM_FFT_DATA, cudaMemcpyHostToDevice);
+    getLastCudaError("cudaMemcpy host_to_device_fft failed");
+}
+
+
+__global__ void add_forces(float2 *v, int px, int py, float fx, float fy, int rad, int dim)
 {
     uint idx = threadIdx.x;
     uint idy = threadIdx.y;
 
-    // float2 *vtp = (float2 *) ((char *)v + (idy + spy)*pitch + idx + spx);
-    // float2 vt = *vtp; // grab velocity target from memory
+    uint ind = (idy + py) * dim + idx + px;
+    float2 vt = v[ind]; // grab velocity target from memory
 
-    // idx -= rad;
-    // idy -= rad;
-    // double s = 1.f / (1.f + pow(idx, 4) + pow(idy, 4));
+    idx -= rad;
+    idy -= rad;
+    float s = 1.f / (1.f + pow(idx, 4) + pow(idy, 4));
 
-    // vt.x += s * fx; // add forces to velocity components
-    // vt.y += s * fy;
+    vt.x += s * fx; // add forces to velocity components
+    vt.y += s * fy;
 
-    // *vtp = vt; // update memory location
+    v[ind] = vt;
 }
 
 
-__global__ void advect_velocity(float2 *v, float *vx, float *vy, int domain, int pad, int dt, int tpr)
+void add_forces_host(float2 *v, int px, int py, float fx, float fy)
 {
-    uint idx = blockIdx.x * blockDim.x + threadIdx.x;
+    dim3 block(2*FRADIUS+1, 2*FRADIUS+1);
+
+    printf("add_forces_host\n");
+
+    add_forces<<<1, block>>>(v, px, py, fx, fy, FRADIUS, DIM);
+    getLastCudaError("add_forces failed.");
+}
+
+
+__global__ void advect_velocity(float2 *v, float *vx, float *vy, int dim, int dt, int tpr)
+{
+    uint idx = blockIdx.x * blockDim.x + threadIdx.x; // column
     uint idy = blockIdx.y * (tpr * blockDim.y) + threadIdx.y * tpr;
 
-    if (idx >= domain) return;
+    if (idx >= dim) return;
 
-    // has to be float2, b/c o conversion from float2 to float2
-    float2 vtex, ploc;
+    float2 vprev;
+    int2 pprev;
 
     for (uint i = 0; i < tpr; i++) {
-        uint j = idy + i;
+        uint j = idy + i; //row
 
-        if (j >= domain) return;
+        if (j >= dim) return;
 
-        uint k = j * pad + idx;
+        uint k = j * dim + idx;
 
-        vtex = tex2D(texObj, (float) idx, (float) j);
+        vprev = v[k];
 
-        ploc.x = (idx + .5f) - (dt*vtex.x*domain); // bilinear interpolation in velocity space
-        ploc.y = (idx + .5f) - (dt*vtex.y*domain);
+        pprev.x = (int)(idx + 0.5f) - (dt * vprev.x * dim); // bilinear interpolation in velocity space
+        pprev.y = (int)(j + 0.5f) - (dt * vprev.y * dim);
 
-        vtex = tex2D<float2>(texObj, ploc.x, ploc.y);
+        if (pprev.x > dim) pprev.x -= dim;
+        if (pprev.y > dim) pprev.y -= dim;
+        if (pprev.x < 0) pprev.x += dim;
+        if (pprev.y < 0) pprev.y += dim;
 
-        vx[k] = vtex.x;
-        vx[k] = vtex.y;
+        int p_ind = pprev.x * dim + pprev.y;
+        vprev = v[p_ind];
+
+        vx[k] = vprev.x;
+        vy[k] = vprev.y;
     }
 }
 
+void advect_velocity_host(float2 *v, float *vx, float *vy)
+{
+    dim3 grid((DIM/TW) + ((DIM%TW) ? 1:0), (DIM/TH) + ((DIM%TH) ? 1:0));
+    dim3 block(BLOCKDX, BLOCKDY);
 
-__global__ void diffuse_projection(float2 *vx, float2 *vy, int domain, int dt, float visc, int tpr)
+    printf("advect_velocity_host\n");
+
+    advect_velocity<<<grid, block>>>(v, vx, vy, DIM, DT, TH/BLOCKDY);
+    getLastCudaError("advect_velocity failed");
+}
+
+
+__global__ void diffuse_projection(float2 *vxcomp, float2 *vycomp, int dim, int dt, float visc, int tpr)
 {
     uint idx = blockIdx.x * blockDim.x + threadIdx.x;
     uint idy = blockIdx.y * (tpr * blockDim.y) + threadIdx.y * tpr;
 
-    if (idx >= domain) return;
+    if (idx >= dim) return;
 
-    float2 xterm, yterm;
+    float2 vxc, vyc;
 
     for (uint i = 0; i < tpr; i++) {
         uint j = idy + i;
 
-        if (j >= domain) return;
+        if (j >= dim) return;
 
-        uint k = j * domain + idx;
-        xterm = vx[k];
-        yterm = vy[k];
+        uint k = j * dim + idx;
+        vxc = vxcomp[k];
+        vyc = vycomp[k];
 
-        int jx = idx;
-        int jy = 0;
+        int iix = idx;
+        int iiy = j;
+        if (j > (dim/2)) iiy -= dim;
 
-        float k_squared = (float)(jx * jx + jy * jy);
-        float diff = 1.0 / (1.0 + visc * dt * k_squared);
-        xterm.x *= diff;
-        xterm.y *= diff;
-        yterm.x *= diff;
-        yterm.y *= diff;
+        float k2 = (float)(iix * iix + iiy * iiy);
+        float diff = 1.0 / (1.0 + visc * dt * k2);
 
-        if (k_squared > 0.0)
+        vxc.x *= diff;
+        vxc.y *= diff;
+        vyc.x *= diff;
+        vyc.y *= diff;
+
+        if (k2 > 0.0f)
         {
-            float inv_k_square = 1.0 / k_squared;
-            float real_k_proj = (jx * xterm.x + jy * yterm.x);
-            float imag_k_proj = (jx * xterm.y + jy * yterm.y);
+            float k2_inv = 1.0f / k2;
+            float real_proj = (iix * vxc.x + iiy * vyc.x) * k2_inv;
+            float imag_proj = (iix * vxc.y + iiy * vyc.y) * k2_inv;
 
-            xterm.x -= real_k_proj * real_k_proj * jx;
-            xterm.y -= real_k_proj * imag_k_proj * jx;
-            yterm.x -= real_k_proj * real_k_proj * jy;
-            yterm.y -= real_k_proj * imag_k_proj * jy;
+            vxc.x -= real_proj * iix;
+            vxc.y -= imag_proj * iix;
+            vyc.x -= real_proj * iiy;
+            vyc.y -= imag_proj * iiy;
         }
 
-        vx[k] = xterm;
-        vy[k] = yterm;
+        vxcomp[k] = vxc;
+        vycomp[k] = vyc;
     }
 }
 
 
+void diffuse_projection_host(float2 *vx, float2 *vy)
+{
+    dim3 grid((DIM/TW) + ((DIM%TW) ? 1:0), (DIM/TH) + ((DIM%TH) ? 1:0));
+    dim3 block(BLOCKDX, BLOCKDY);
 
-__global__ void update_velocity(float2* v, float *vx, float *vy, int domain, int pad, int dt, int tpr, size_t pitch)
+    printf("diffuse_projection_host\n");
+
+    diffuse_projection<<<grid, block>>>(vx, vy, DIM, DT, VISC, TH/BLOCKDY);
+    getLastCudaError("diffuse_projection failed");
+
+}
+
+
+__global__ void update_velocity(float2* v, float *vx, float *vy, int dim, int dt, int tpr)
 {
     uint idx = blockIdx.x * blockDim.x + threadIdx.x;
     uint idy = blockIdx.y * (tpr * blockDim.y) + threadIdx.y * tpr;
 
-    if (idx >= domain) return;
+    if (idx >= dim) return;
 
-    float2 nvterm;
+    float2 vnew;
 
     for (uint i = 0; i < tpr; i++) {
         uint j = idy + i;
 
-        if (j >= domain) return;
+        if (j >= dim) return;
 
-        uint k = j * pad + idx;
+        uint k = j * dim + idx;
 
-        float scale = 1.0 / (domain * domain);
+        float scale = 0.5;  // can be modified to many different values
+        // NOTE: 1.f or greater is very unstable
 
-        nvterm.x = vx[k] * scale;
-        nvterm.y = vy[k] * scale;
+        vnew.x = vx[k] * scale;
+        vnew.y = vy[k] * scale;
 
-        float2 *vel = (float2 *)((char *)v + j * pitch) + idx;
-        *vel = nvterm;
+        v[k] = vnew;
     }
 }
 
 
-void update_velocity_cpu(float2* vdev, float *vx, float *vy, int domain, int pad, int dt, int tpr)
+void update_velocity_host(float2* v, float *vx, float *vy)
 {
-    dim3 grid(TW, TH);
+    dim3 grid((DIM/TW) + ((DIM%TW) ? 1:0), (DIM/TH) + ((DIM%TH) ? 1:0));
     dim3 block(BLOCKDX, BLOCKDY);
 
-    update_velocity<<<grid, block>>>(vdev, vx, vy, domain, pad, dt, tpr, t_pitch);
+    printf("update_velocity_host\n");
+
+    update_velocity<<<grid, block>>>(v, vx, vy, DIM, DT, TH/BLOCKDY);
+    getLastCudaError("update_velocity failed");
 }
 
 
-__global__ void advect_particles(float2* p, float2* v, int domain, int dt, int tpr, size_t t_pitch)
+__global__ void advect_particles(float2* p, float2* v, int dim, float dt, int tpr)
 {
+    uint idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint idy = blockIdx.y * (tpr * blockDim.y) + threadIdx.y * tpr;
 
+    if (idx >= dim) return;
+
+    float2 pt, vprev;
+
+    for (uint i = 0; i < tpr; i++) {
+        uint j = idy + i;
+
+        if (j >= dim) return;
+
+        int k = j * dim + idx;
+        pt = p[k];
+
+        int xvi = ((int)(pt.x * dim));
+        int yvi = ((int)(pt.y * dim));
+
+        int v_ind = yvi*dim + xvi;
+        vprev = v[v_ind];
+
+        pt.x += dt * vprev.x;
+        pt.y += dt * vprev.y;
+
+        if (pt.x < 0.f) pt.x += 1.f;
+        if (pt.x > 1.f) pt.x -= 1.f;
+        if (pt.y < 0.f) pt.y += 1.f;
+        if (pt.y > 1.f) pt.y -= 1.f;
+
+        p[k] = pt;
+    }
 }
 
 
-void advect_particles_cpu(float2* p, float2* vdev, int domain, int dt, int tpr)
+void advect_particles_host(float2* p, float2* v)
 {
-    dim3 grid(TW, TH);
+    dim3 grid((DIM/TW) + ((DIM%TW) ? 1:0), (DIM/TH) + ((DIM%TH) ? 1:0));
     dim3 block(BLOCKDX, BLOCKDY);
 
-    advect_particles<<<grid, block>>>(p, vdev, domain, dt, tpr, t_pitch);
-}
+    printf("advect_particles_host\n");
 
+    advect_particles<<<grid, block>>>(p, v, DIM, DT, TH/BLOCKDY);
+    getLastCudaError("advect_particles failed");
 
-void bindTexture(void)
-{
-    cudaBindTextureToArray(texObj, texArray);
-    getLastCudaError("cudaBindTexture failed");
-}
-
-
-void updateTexture(float2 *vdev)
-{
-    // cout << DIM << endl;
-    cudaMemcpy2DToArray(texArray, 0, 0, vdev, t_pitch, DIM*sizeof(float2), DIM, cudaMemcpyDeviceToDevice);
-    // getLastCudaError("cudaMemcpy failed");
-}
-
-
-void setupTexture(int x, int y)
-{
-    texObj.filterMode = cudaFilterModeLinear;
-    cudaChannelFormatDesc desc = cudaCreateChannelDesc<float2>();
-
-    cudaMallocArray(&texArray, &desc, y, x);
-    getLastCudaError("cudaMalloc failed");
-
-    // cudaResourceDesc texRes;
-    // memset(&texRes,0,sizeof(cudaResourceDesc));
-    //
-    // texRes.resType = cudaResourceTypeArray;
-    // texRes.res.array.array = array;
-    // //
-    //
-    // cudaTextureDesc texDescr;
-    // memset(&texDescr,0,sizeof(cudaTextureDesc));
-    //
-    // texDescr.normalizedCoords = false;
-    // texDescr.filterMode       = cudaFilterModeLinear;
-    // texDescr.addressMode[0] = cudaAddressModeWrap;
-    // texDescr.readMode = cudaReadModeElementType;
-    //
-    // checkCudaErrors(cudaCreateTextureObject(&texObj, &texRes, &texDescr, NULL));
 }
